@@ -1,0 +1,448 @@
+// Author: Brachi
+
+// Source: Commands\BundleCommand.cs
+// הפקודה bundle: מגדירה את האפשרויות ואת בדיקות הקלט שלהן,
+// ומעבירה את מה שהמשתמש בחר למחלקה Bundler שמבצעת את האריזה.
+using System.CommandLine;
+namespace Fid.Commands;
+static class BundleCommand
+{
+    public static Command Create()
+    {
+        var languageOption = CreateLanguageOption();
+        var outputOption = CreateOutputOption();
+        var noteOption = new Option<bool>("--note", "-n")
+        {
+            Description = "Write the source file path as a comment above its code"
+        };
+        var sortOption = new Option<string>("--sort", "-s")
+        {
+            Description = "Order of the files: by file name or by code type",
+            DefaultValueFactory = _ => "name"
+        };
+        sortOption.AcceptOnlyFromAmong(BundleSettings.SortValues);
+        var removeEmptyLinesOption = new Option<bool>("--remove-empty-lines", "-r")
+        {
+            Description = "Remove empty lines from the code"
+        };
+        var authorOption = new Option<string>("--author", "-a")
+        {
+            Description = "Author name to write at the top of the bundle"
+        };
+        var command = new Command("bundle", "Bundle code files into a single file")
+        {
+            languageOption, outputOption, noteOption, sortOption, removeEmptyLinesOption, authorOption
+        };
+        // הפעולה: אוספת את הערכים שנותחו להגדרות, מריצה את האריזה על התיקייה הנוכחית ומדפיסה את התוצאה.
+        // הערכים כבר עברו בדיקה בוולידטורים, ולכן כאן לא בודקים אותם שוב.
+        command.SetAction(parseResult =>
+        {
+            Languages.TryGetExtensions(parseResult.GetValue(languageOption)!, out var extensions, out _);
+            var settings = new BundleSettings(
+                extensions,
+                parseResult.GetValue(outputOption)!,
+                parseResult.GetValue(noteOption),
+                parseResult.GetValue(sortOption)!,
+                parseResult.GetValue(removeEmptyLinesOption),
+                parseResult.GetValue(authorOption));
+            var result = Bundler.Run(Directory.GetCurrentDirectory(), settings);
+            foreach (var warning in result.Warnings)
+                Console.Error.WriteLine(warning);
+            if (!result.Succeeded)
+            {
+                Console.Error.WriteLine(result.Error);
+                return 1;
+            }
+            Console.WriteLine($"Bundled {result.Files} file(s), {result.Lines} line(s) into {settings.Output.FullName}");
+            return 0;
+        });
+        return command;
+    }
+    // האפשרות --language: חובה, מקבלת כמה שפות אחרי אותו דגל,
+    // ודוחה כבר בשלב הניתוח שם שפה שלא קיים ב-Languages.
+    private static Option<string[]> CreateLanguageOption()
+    {
+        var option = new Option<string[]>("--language", "-l")
+        {
+            Description = $"Languages to include ({string.Join(", ", Languages.Names)}), or '{Languages.All}'",
+            Required = true,
+            AllowMultipleArgumentsPerToken = true
+        };
+        option.Validators.Add(result =>
+        {
+            if (!Languages.TryGetExtensions(result.Tokens.Select(t => t.Value), out _, out var error))
+                result.AddError(error);
+        });
+        return option;
+    }
+    // האפשרות --output: שם או נתיב של קובץ הפלט, ברירת מחדל bundle.txt.
+    // הבדיקה דוחה מראש נתיב שהוא תיקייה, נתיב בתיקייה שלא קיימת, או נתיב לא חוקי.
+    private static Option<FileInfo> CreateOutputOption()
+    {
+        var option = new Option<FileInfo>("--output", "-o")
+        {
+            Description = "Bundle file name or full path",
+            DefaultValueFactory = _ => new FileInfo("bundle.txt")
+        };
+        option.Validators.Add(result =>
+        {
+            var path = result.Tokens.FirstOrDefault()?.Value;
+            if (path is null)
+                return;
+            try
+            {
+                var folder = Path.GetDirectoryName(Path.GetFullPath(path));
+                if (Directory.Exists(path))
+                    result.AddError($"'{path}' is a folder. Please give a file name.");
+                else if (folder is not null && !Directory.Exists(folder))
+                    result.AddError($"The folder '{folder}' does not exist.");
+            }
+            catch (Exception ex) when (ex is ArgumentException or NotSupportedException or PathTooLongException)
+            {
+                result.AddError($"'{path}' is not a valid path. {ex.Message}");
+            }
+        });
+        return option;
+    }
+}
+
+// Source: Bundler.cs
+// הלוגיקה של האריזה: מוצאת את קובצי הקוד, ממיינת אותם, מחברת את התוכן שלהם ושומרת לקובץ אחד.
+// המחלקה לא מדפיסה לקונסול ולא תלויה בשורת הפקודה. היא מחזירה BundleResult, והפקודה מחליטה מה להציג.
+using System.Text;
+namespace Fid;
+static class Bundler
+{
+    // מריץ אריזה מלאה של התיקייה root לפי ההגדרות.
+    // נכשל אם לא נמצאו קבצים, אם אף קובץ לא נקרא, או אם לא ניתן לשמור את קובץ הפלט.
+    public static BundleResult Run(string root, BundleSettings settings)
+    {
+        var files = SelectFiles(root, settings);
+        if (files.Count == 0)
+            return new BundleResult(0, 0, [], "No code files of the selected languages were found in this folder.");
+        var warnings = new List<string>();
+        var (content, bundledFiles, bundledLines) = BuildContent(root, files, settings, warnings);
+        if (bundledFiles == 0)
+            return new BundleResult(0, 0, warnings, "Error: none of the code files could be read.");
+        try
+        {
+            File.WriteAllText(settings.Output.FullName, content);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException or ArgumentException)
+        {
+            return new BundleResult(bundledFiles, bundledLines, warnings,
+                $"Error: could not save the bundle to '{settings.Output.FullName}'. {ex.Message}");
+        }
+        return new BundleResult(bundledFiles, bundledLines, warnings);
+    }
+    // מוצא את הקבצים מהשפות שנבחרו, בלי קובץ הפלט עצמו (שלא ייארז לתוך עצמו), וממיין אותם.
+    // במקרה של שוויון ממיינים לפי הנתיב המלא, כדי שאותה תיקייה תיתן תמיד את אותו סדר.
+    private static List<string> SelectFiles(string root, BundleSettings settings)
+    {
+        var files = FileFinder.FindFiles(root)
+            .Where(f => settings.Extensions.Contains(Path.GetExtension(f)))
+            .Where(f => !string.Equals(f, settings.Output.FullName, StringComparison.OrdinalIgnoreCase));
+        var sorted = settings.Sort == "type"
+            ? files.OrderBy(f => Path.GetExtension(f), StringComparer.OrdinalIgnoreCase)
+                   .ThenBy(f => Path.GetFileName(f), StringComparer.OrdinalIgnoreCase)
+                   .ThenBy(f => f, StringComparer.OrdinalIgnoreCase)
+            : files.OrderBy(f => Path.GetFileName(f), StringComparer.OrdinalIgnoreCase)
+                   .ThenBy(f => f, StringComparer.OrdinalIgnoreCase);
+        return sorted.ToList();
+    }
+    // מחבר את תוכן הקבצים לטקסט אחד: שם היוצר בראש, הערת מקור מעל כל קובץ (אם נבחר),
+    // ושורה ריקה בין קבצים. קובץ שלא ניתן לקרוא מדולג, והסיבה נוספת לרשימת האזהרות.
+    private static (string Content, int Files, int Lines) BuildContent(
+        string root, List<string> files, BundleSettings settings, List<string> warnings)
+    {
+        var bundle = new StringBuilder();
+        if (!string.IsNullOrWhiteSpace(settings.Author))
+            bundle.AppendLine(Languages.Comment(settings.Output.Extension, $"Author: {settings.Author}")).AppendLine();
+        var bundledFiles = 0;
+        var bundledLines = 0;
+        foreach (var file in files)
+        {
+            IEnumerable<string> lines;
+            try
+            {
+                lines = File.ReadAllLines(file);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                warnings.Add($"Warning: skipped '{Path.GetRelativePath(root, file)}'. {ex.Message}");
+                continue;
+            }
+            if (settings.Note)
+                bundle.AppendLine(Languages.Comment(Path.GetExtension(file), $"Source: {Path.GetRelativePath(root, file)}"));
+            if (settings.RemoveEmptyLines)
+                lines = lines.Where(line => !string.IsNullOrWhiteSpace(line));
+            foreach (var line in lines)
+            {
+                bundle.AppendLine(line);
+                bundledLines++;
+            }
+            bundle.AppendLine();
+            bundledFiles++;
+        }
+        return (bundle.ToString(), bundledFiles, bundledLines);
+    }
+}
+
+// Source: BundleResult.cs
+// התוצאה של פעולת אריזה: כמה קבצים ושורות נארזו, אזהרות על קבצים שדולגו,
+// והודעת שגיאה אם האריזה נכשלה.
+namespace Fid;
+record BundleResult(int Files, int Lines, IReadOnlyList<string> Warnings, string? Error = null)
+{
+    public bool Succeeded => Error is null;
+}
+
+// Source: BundleSettings.cs
+// ההגדרות של פעולת אריזה אחת, כפי שהמשתמש בחר אותן בשורת הפקודה.
+namespace Fid;
+record BundleSettings(
+    HashSet<string> Extensions,
+    FileInfo Output,
+    bool Note,
+    string Sort,
+    bool RemoveEmptyLines,
+    string? Author)
+{
+    // הערכים המותרים לאפשרות המיון: לפי שם הקובץ או לפי סוג הקוד (סיומת)
+    public static readonly string[] SortValues = ["name", "type"];
+}
+
+// Source: ConsolePrompt.cs
+// שאלות למשתמש בקונסול: שאלה חופשית, שאלת כן/לא ושאלה על נתיב קובץ.
+// משמשת את הפקודה create-rsp.
+namespace Fid;
+static class ConsolePrompt
+{
+    // מציג שאלה ומחזיר את התשובה בלי רווחים מסביב.
+    // אם הקלט נגמר (Ctrl+Z או קלט מקובץ שהסתיים) התוכנית יוצאת, כדי שלולאות השאלות לא ייתקעו.
+    public static string Ask(string question)
+    {
+        Console.Write(question + " ");
+        var answer = Console.ReadLine();
+        if (answer is null)
+        {
+            Console.Error.WriteLine("Input ended unexpectedly.");
+            Environment.Exit(1);
+        }
+        return answer.Trim();
+    }
+    // שואל שאלת כן/לא עד שמתקבלת תשובה מובנת. Enter בלי תשובה נחשב "לא".
+    public static bool AskYesNo(string question)
+    {
+        while (true)
+        {
+            var answer = Ask(question + " (y/n, Enter for no):").ToLowerInvariant();
+            if (answer is "y" or "yes")
+                return true;
+            if (answer is "" or "n" or "no")
+                return false;
+            Console.WriteLine("Please answer y or n.");
+        }
+    }
+    // שואל על נתיב עד שמתקבלת תשובה בלי תווים אסורים. מסיר מרכאות מסביב (כמו בנתיב שהועתק מ-Windows).
+    // תשובה ריקה מותרת, והמתקשר מחליט מה ברירת המחדל.
+    public static string AskPath(string question, string invalidMessage)
+    {
+        while (true)
+        {
+            var path = Ask(question).Trim('"');
+            if (path.IndexOfAny(Path.GetInvalidPathChars()) < 0)
+                return path;
+            Console.WriteLine(invalidMessage);
+        }
+    }
+}
+
+// Source: Commands\CreateRspCommand.cs
+// הפקודה create-rsp: שואלת את המשתמש על כל אפשרות, בודקת כל תשובה,
+// ושומרת קובץ תגובה (rsp) עם פקודת bundle מוכנה. מריצים אותו עם: fid "@bundle.rsp"
+using System.CommandLine;
+using System.Text;
+namespace Fid.Commands;
+static class CreateRspCommand
+{
+    public static Command Create()
+    {
+        var command = new Command("create-rsp", "Create a response file with a ready bundle command");
+        command.SetAction(_ => Run());
+        return command;
+    }
+    // אוספת את כל התשובות לפי הסדר, בונה מהן את פקודת bundle ושומרת אותה בקובץ.
+    // מחזירה 0 בהצלחה ו-1 אם לא ניתן לשמור את הקובץ.
+    private static int Run()
+    {
+        var language = AskLanguages();
+        var output = ConsolePrompt.AskPath("Bundle file name or full path (Enter for bundle.txt):",
+            "The path contains invalid characters.");
+        var note = ConsolePrompt.AskYesNo("Write the source of each file as a comment?");
+        var sort = AskSort();
+        var removeEmptyLines = ConsolePrompt.AskYesNo("Remove empty lines?");
+        // מרכאות נמחקות מהשם, כי השם נעטף במרכאות בפקודה ומרכאה בתוכו הייתה שוברת אותה
+        var author = ConsolePrompt.Ask("Author name (Enter to skip):").Replace("\"", "");
+        var rspFile = ConsolePrompt.AskPath("Response file name (Enter for bundle.rsp):",
+            "The file name contains invalid characters.");
+        if (rspFile == "")
+            rspFile = "bundle.rsp";
+        var commandLine = BuildCommandLine(language, output, note, sort, removeEmptyLines, author);
+        try
+        {
+            File.WriteAllText(rspFile, commandLine);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException or ArgumentException)
+        {
+            Console.Error.WriteLine($"Error: could not save the response file '{rspFile}'. {ex.Message}");
+            return 1;
+        }
+        Console.WriteLine($"Response file created. Run it with: fid \"@{rspFile}\"");
+        return 0;
+    }
+    // שואלת אילו שפות לארוז עד שמתקבלת לפחות שפה אחת, וכל השפות מוכרות.
+    // הבדיקה זהה לזו של האפשרות --language, כי שתיהן משתמשות ב-Languages.TryGetExtensions.
+    private static string AskLanguages()
+    {
+        while (true)
+        {
+            var language = ConsolePrompt.Ask(
+                $"Languages, separated by spaces ({string.Join(", ", Languages.Names)}), or '{Languages.All}':");
+            var tokens = language.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+            if (tokens.Length == 0)
+                Console.WriteLine("At least one language is required.");
+            else if (!Languages.TryGetExtensions(tokens, out _, out var error))
+                Console.WriteLine(error);
+            else
+                return language;
+        }
+    }
+    // שואלת לפי מה למיין עד שמתקבל ערך מותר. תשובה ריקה אומרת ברירת מחדל (name).
+    private static string AskSort()
+    {
+        while (true)
+        {
+            var sort = ConsolePrompt.Ask("Sort files by 'name' or 'type' (Enter for name):").ToLowerInvariant();
+            if (sort == "" || BundleSettings.SortValues.Contains(sort))
+                return sort;
+            Console.WriteLine("Please type 'name' or 'type'.");
+        }
+    }
+    // בונה את שורת הפקודה. אפשרות שנשארה בברירת המחדל לא נכתבת,
+    // ונתיב ושם יוצר נעטפים במרכאות כדי שרווחים בתוכם לא יפצלו אותם.
+    private static string BuildCommandLine(string language, string output, bool note, string sort,
+        bool removeEmptyLines, string author)
+    {
+        var command = new StringBuilder($"bundle --language {language}");
+        if (output != "")
+            command.Append($" --output \"{output}\"");
+        if (note)
+            command.Append(" --note");
+        if (sort != "")
+            command.Append($" --sort {sort}");
+        if (removeEmptyLines)
+            command.Append(" --remove-empty-lines");
+        if (author != "")
+            command.Append($" --author \"{author}\"");
+        return command.ToString();
+    }
+}
+
+// Source: FileFinder.cs
+// חיפוש קבצים בתיקייה ובכל תתי-התיקיות שלה,
+// תוך דילוג על תיקיות של פלט בנייה, ספריות חיצוניות וכלי פיתוח.
+namespace Fid;
+static class FileFinder
+{
+    private static readonly HashSet<string> excludedFolders = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "bin", "obj", "debug", "release", "publish", "node_modules", ".git", ".vs", ".vscode", ".idea"
+    };
+    // מחזיר את כל הקבצים בתיקייה, ונכנס ברקורסיה לכל תת-תיקייה שאינה ברשימת המוחרגות.
+    // הקבצים מוחזרים אחד-אחד (yield), ותיקיות ללא הרשאה מדולגות בשקט.
+    public static IEnumerable<string> FindFiles(string folder)
+    {
+        var options = new EnumerationOptions { IgnoreInaccessible = true };
+        foreach (var file in Directory.EnumerateFiles(folder, "*", options))
+            yield return file;
+        foreach (var subFolder in Directory.EnumerateDirectories(folder, "*", options))
+        {
+            if (excludedFolders.Contains(Path.GetFileName(subFolder)))
+                continue;
+            foreach (var file in FindFiles(subFolder))
+                yield return file;
+        }
+    }
+}
+
+// Source: Languages.cs
+// השפות שהכלי מכיר: הסיומות של כל שפה ותחביר ההערות של כל סוג קובץ.
+// כל מקום בקוד שצריך לדעת משהו על שפות נשען על המחלקה הזו, כך שהוספת שפה נעשית רק כאן.
+namespace Fid;
+static class Languages
+{
+    public const string All = "all";
+    private static readonly Dictionary<string, string[]> extensionsByLanguage = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["csharp"] = [".cs"],
+        ["java"] = [".java"],
+        ["python"] = [".py"],
+        ["javascript"] = [".js", ".jsx"],
+        ["typescript"] = [".ts", ".tsx"],
+        ["html"] = [".html", ".htm"],
+        ["css"] = [".css"],
+        ["sql"] = [".sql"],
+        ["cpp"] = [".cpp", ".hpp", ".h"],
+        ["c"] = [".c", ".h"],
+        ["php"] = [".php"],
+        ["go"] = [".go"],
+        ["rust"] = [".rs"],
+        ["ruby"] = [".rb"],
+        ["kotlin"] = [".kt", ".kts"],
+        ["swift"] = [".swift"],
+    };
+    public static IEnumerable<string> Names => extensionsByLanguage.Keys;
+    // מתרגם רשימת שמות שפות (או "all") לקבוצת סיומות קבצים.
+    // אם אחד השמות לא מוכר מחזיר false, ובפרמטר error הודעה עם רשימת השפות הנתמכות.
+    public static bool TryGetExtensions(IEnumerable<string> names, out HashSet<string> extensions, out string error)
+    {
+        extensions = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        error = "";
+        foreach (var name in names)
+        {
+            if (name.Equals(All, StringComparison.OrdinalIgnoreCase))
+                extensions.UnionWith(extensionsByLanguage.Values.SelectMany(e => e));
+            else if (extensionsByLanguage.TryGetValue(name, out var found))
+                extensions.UnionWith(found);
+            else
+            {
+                error = $"Unknown language '{name}'. Supported: {string.Join(", ", Names)}, {All}";
+                return false;
+            }
+        }
+        return true;
+    }
+    // עוטף טקסט בתחביר ההערה המתאים לסוג הקובץ, כדי שההערה לא תשבור את הקוד.
+    // ברירת המחדל היא // שמתאימה לרוב השפות וגם לקובץ txt.
+    public static string Comment(string extension, string text) => extension.ToLowerInvariant() switch
+    {
+        ".py" or ".rb" => $"# {text}",
+        ".html" or ".htm" => $"<!-- {text} -->",
+        ".css" => $"/* {text} */",
+        ".sql" => $"-- {text}",
+        _ => $"// {text}"
+    };
+}
+
+// Source: Program.cs
+// נקודת הכניסה של הכלי fid.
+// יוצרת את פקודת השורש, מחברת אליה את שתי תתי-הפקודות ומריצה את מה שהמשתמש הקליד.
+using System.CommandLine;
+using Fid.Commands;
+var rootCommand = new RootCommand("CLI tool for bundling code files");
+rootCommand.Subcommands.Add(BundleCommand.Create());
+rootCommand.Subcommands.Add(CreateRspCommand.Create());
+// מנתח את הארגומנטים, מריץ את הפקודה המתאימה ומחזיר את קוד היציאה שלה (0 הצלחה, 1 כישלון)
+return rootCommand.Parse(args).Invoke();
+
